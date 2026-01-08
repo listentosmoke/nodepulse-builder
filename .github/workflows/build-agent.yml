@@ -58,7 +58,7 @@ jobs:
       - name: Upload to Supabase Storage
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
           BINARY_PATH="builder/agent_${{ inputs.target_os }}_${{ inputs.target_arch }}"
           if [ "${{ inputs.target_os }}" == "windows" ]; then
